@@ -250,7 +250,9 @@ manifests_from_log() {
 manifests_line() { printf '%s\n' "$1" | tr ' ' ':' | tr '\n' ' ' | sed 's/ $//'; }
 
 installed_manifests() {
-    [[ -f "${INSTALLED_MANIFESTS_FILE}" ]] && sort -u "${INSTALLED_MANIFESTS_FILE}" || true
+    if [[ -f "${INSTALLED_MANIFESTS_FILE}" ]]; then
+        sort -u "${INSTALLED_MANIFESTS_FILE}"
+    fi
 }
 
 # What Steam serves right now: a -manifest-only run into a scratch directory (a few hundred KB, no game files).
@@ -492,7 +494,6 @@ request_stop_all() {
     STOP_TIMER_PID=$!
 }
 
-# shellcheck disable=SC2329  # invoked from the USR2 trap
 force_stop_all() {
     local shard
     for shard in "${SHARDS[@]}"; do
@@ -548,11 +549,8 @@ supervise() {
     return "${unexpected}"
 }
 
-# shellcheck disable=SC2329  # trap handlers
 on_term() { log "Stop requested (signal)."; request_stop_all; }
-# shellcheck disable=SC2329
 on_usr1() { request_stop_all; }
-# shellcheck disable=SC2329
 on_usr2() { force_stop_all; }
 
 main() {

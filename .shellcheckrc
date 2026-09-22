@@ -1,0 +1,3 @@
+# SC2317/SC2329: "unreachable" / "never invoked" — false positives for the trap handlers (on_term, on_usr1,
+# on_usr2, force_stop_all) that bash calls on a signal.
+disable=SC2317,SC2329
