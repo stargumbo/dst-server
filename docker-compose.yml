@@ -1,0 +1,26 @@
+# Don't Starve Together dedicated server: Master (Forest) + Caves in one container.
+#
+#   cp .env.example .env      # cluster name, player count, PUID/PGID, ...
+#   docker compose up -d
+#   docker compose logs -f
+#
+# The Klei cluster token is NOT in .env. Either put it in ./data/DoNotStarveTogether/Cluster_1/cluster_token.txt
+# yourself (the file the game reads), or point CLUSTER_TOKEN_FILE at a file that holds it, as below.
+# The join password is a line in cluster.ini ([NETWORK] cluster_password = ...), edited by you; this image never
+# reads or writes it.
+services:
+  dst:
+    image: ghcr.io/stargumbo/dst-server:1
+    container_name: dst
+    restart: unless-stopped
+    # c_shutdown(true) is typed into both shards on stop and they save first; the game says this can take up to
+    # ~5 minutes on a large world. Docker's default 10 s would SIGKILL them mid-save.
+    stop_grace_period: 300s
+    init: true
+    env_file: .env
+    ports:
+      - "10999-11000:10999-11000/udp"   # 10999 Master, 11000 Caves (players)
+      - "12346-12347:12346-12347/udp"   # Master's Steam master-server / authentication ports
+    volumes:
+      - ./data:/data
+      # - ./cluster_token.txt:/run/secrets/cluster_token:ro   # with CLUSTER_TOKEN_FILE=/run/secrets/cluster_token in .env

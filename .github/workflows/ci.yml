@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Shellcheck the shell scripts
+        run: shellcheck entrypoint.sh redact.sh scripts/fetch-depotdownloader.sh tests/run-local.sh
+
+      # The game stage downloads ~3 GB from Steam and the runner's disk is finite: drop the preinstalled
+      # toolchains first so the 4 GB image, its build layers and the test data all fit.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Docker build
+        run: docker build --pull -t dst-server:ci --build-arg BUILD_VERSION=ci --build-arg BUILD_REVISION="${GITHUB_SHA}" .
+
+      - name: Report the baked game build and the libraries the base lacked
+        run: |
+          set -euo pipefail
+          cid="$(docker create dst-server:ci)"
+          docker cp "${cid}:/app/version.txt" - | tar -xO
+          echo
+          docker cp "${cid}:/app/.dst-manifests" - | tar -xO
+          docker cp "${cid}:/usr/share/doc/dst-server/ldd-missing.txt" - | tar -xO
+          docker rm "${cid}" >/dev/null
+
+      # Offline cluster, no token: boot, shard link, generated config, ownership, console + redaction,
+      # docker stop saving both worlds, reload with UPDATE_ON_START, shard death, refusal paths.
+      - name: Test suite
+        run: IMAGE=dst-server:ci tests/run-local.sh
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          for c in $(docker ps -a --filter name=dst-test- --format '{{.Names}}'); do
+            echo "::group::${c}"; docker logs "${c}" 2>&1 | grep -v Pre-allocating | tail -n 200; echo "::endgroup::"
+          done
+
+      - name: Clean up
+        if: always()
+        run: IMAGE=dst-server:ci tests/run-local.sh clean || true

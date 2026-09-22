@@ -1,0 +1,40 @@
+Third-party software in the dst-server image
+============================================
+
+This repository is MIT licensed (see LICENSE). The container image built from it also contains
+the following third-party software, each under its own license.
+
+DepotDownloader
+---------------
+  Version:   3.4.0 (GitHub release DepotDownloader_3.4.0; official linux-x64 build)
+  License:   GNU General Public License v2.0 (GPL-2.0)
+  Source:    https://github.com/SteamRE/DepotDownloader/tree/DepotDownloader_3.4.0
+  Release:   https://github.com/SteamRE/DepotDownloader/releases/tag/DepotDownloader_3.4.0
+  In image:  /opt/depotdownloader/DepotDownloader  the unmodified release binary
+             /opt/depotdownloader/LICENSE          the GPL-2.0 text, as shipped in the release zip
+             /opt/depotdownloader/RELEASE.txt      asset name, download URL and the sha256 verified at build
+
+  DepotDownloader is used exactly as SteamRE released it. The Dockerfile downloads the zip by pinned
+  version and sha256 (ARG DD_VERSION, DD_SHA256_AMD64), verifies it and unpacks it; it is not built
+  from source, not modified and not vendored into this repository. The image runs it as a separate
+  program: at build time to fetch the game files from Steam, and at run time for UPDATE_ON_START and
+  AUTO_UPDATE_INTERVAL_MINUTES, always with Steam's anonymous dedicated-server access. The GPL-2.0
+  applies to DepotDownloader itself; its corresponding source is the tagged tree linked above.
+
+Don't Starve Together dedicated server
+--------------------------------------
+  The game files under /app (bin64/, data/, mods/, the Steamworks redistributables steamclient.so and
+  libsteamwebrtc.so) are downloaded from Steam (app 343050) with the anonymous dedicated-server
+  subscription. They belong to Klei Entertainment and their respective owners and are not covered by
+  this repository's license.
+
+Debian
+------
+  The base image, debian:trixie-slim, carries its own licenses: https://hub.docker.com/_/debian.
+
+Prior art
+---------
+  Jamesits/docker-dst-server (https://github.com/Jamesits/docker-dst-server, GPL-2.0) was the
+  reference for this image's behaviour (port layout, the /data mount, the ~5 minute save on stop).
+  No code or file from that repository is included here; this is an independent implementation,
+  structurally modelled on stargumbo/necesse-server (MIT).

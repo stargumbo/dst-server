@@ -1,0 +1,238 @@
+name: Publish
+
+# One build, one platform (linux/amd64: there is no arm64 DST server), two registries, identical digests.
+#   ghcr.io/stargumbo/dst-server     always
+#   docker.io/stargumbo/dst-server   when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repository secrets exist
+#
+#   - push of a v* tag:  builds that tag -> :X.Y.Z, :X.Y, :X, :latest, plus the game-build tags
+#                        :X.Y.Z-<build> and :<build> (e.g. 1.0.0-747465, 747465).
+#   - weekly (Mondays) and manual dispatch: rebuilds the newest v* tag with pull: true and a fresh
+#                        STEAM_REFRESH build argument, so the base image and the Steam server build refresh
+#                        unattended, and pushes the same semver tag set. The floating :<build> tag is created
+#                        only when that build does not exist yet; :X.Y.Z-<build> is never re-pointed once it exists.
+#
+# The game build number is /app/version.txt inside the image that was just pushed; nothing is hard-coded.
+# This workflow never changes the image itself.
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  HUB_IMAGE: docker.io/stargumbo/dst-server
+  PLATFORMS: linux/amd64
+  # Secrets cannot be tested in `if:` directly, so the username is copied into the environment; every
+  # Docker Hub step is skipped (with a notice) while it is empty and GHCR publishing is unaffected.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the tag to build
+        id: ref
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+            if [ -z "${tag}" ]; then
+              echo "No v* tag exists yet; nothing to rebuild." >&2
+              exit 1
+            fi
+            git checkout -q "${tag}"
+          fi
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+          echo "Building ${tag} at $(git rev-parse --short HEAD)"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Choose the registries
+        id: registries
+        run: |
+          set -euo pipefail
+          images="${GHCR_IMAGE}"
+          if [ -n "${DOCKERHUB_USERNAME}" ]; then
+            images="${images}"$'\n'"${HUB_IMAGE}"
+          else
+            echo "::notice::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set; publishing to GHCR only."
+          fi
+          { echo "images<<EOF"; echo "${images}"; echo "EOF"; } >>"$GITHUB_OUTPUT"
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.registries.outputs.images }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.ref.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.ref.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.ref.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # STEAM_REFRESH busts the cache of the game-fetch layer: without it a weekly rebuild whose base image
+          # did not change would reuse last week's Steam build from the layer cache.
+          build-args: |
+            BUILD_VERSION=${{ steps.ref.outputs.version }}
+            BUILD_REVISION=${{ steps.ref.outputs.sha }}
+            STEAM_REFRESH=${{ github.run_id }}
+          # The 4 GB game layer is not worth caching between runs (STEAM_REFRESH invalidates it anyway).
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Verify the digest is identical in every registry
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          IMAGES: ${{ steps.registries.outputs.images }}
+        run: |
+          set -euo pipefail
+          for image in ${IMAGES}; do
+            got="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{.Manifest.Digest}}')"
+            echo "${image}:${VERSION} -> ${got}"
+            if [ "${got}" != "${DIGEST}" ]; then
+              echo "::error::${image}:${VERSION} resolves to ${got} but the build pushed ${DIGEST}; the registries disagree. Stopping before any game-build tag is created." >&2
+              exit 1
+            fi
+          done
+
+      - name: Read the game build from the pushed image
+        id: game
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="${GHCR_IMAGE}@${DIGEST}"
+          docker pull -q "${ref}"
+          cid="$(docker create "${ref}")"
+          docker cp "${cid}:/app/version.txt" ./version.txt
+          docker cp "${cid}:/app/.dst-manifests" ./manifests.txt
+          docker rm "${cid}" >/dev/null
+          build="$(tr -d '[:space:]' < ./version.txt)"
+          case "${build}" in
+            ''|*[!0-9]*) echo "::error::/app/version.txt does not hold a build number: '${build}'" >&2; exit 1 ;;
+          esac
+          manifests="$(tr '\n' ' ' < ./manifests.txt | sed 's/ $//')"
+          rm -f ./version.txt ./manifests.txt
+          echo "Game build in ${ref}: ${build}; depot manifests: ${manifests}"
+          echo "build=${build}" >>"$GITHUB_OUTPUT"
+          echo "manifests=${manifests}" >>"$GITHUB_OUTPUT"
+
+      - name: Push the game-build tags
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          IMAGES: ${{ steps.registries.outputs.images }}
+          GAME: ${{ steps.game.outputs.build }}
+          MANIFESTS: ${{ steps.game.outputs.manifests }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Digest a tag currently resolves to; empty when the tag does not exist; any other failure is fatal.
+          resolve() {
+            if out="$(docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2>&1)"; then
+              printf '%s' "${out}"
+              return 0
+            fi
+            case "${out}" in
+              *"not found"*|*MANIFEST_UNKNOWN*|*NAME_UNKNOWN*) return 0 ;;
+            esac
+            echo "::error::cannot inspect $1: ${out}" >&2
+            exit 1
+          }
+
+          pin="${VERSION}-${GAME}"
+          floating="${GAME}"
+
+          if [ "${EVENT}" = "push" ]; then
+            mode="release"
+          elif [ -z "$(resolve "${GHCR_IMAGE}:${GAME}")" ]; then
+            mode="new game build"
+          else
+            mode="unchanged"
+          fi
+          echo "Game build ${GAME} on ${EVENT}: ${mode}"
+
+          case "${mode}" in
+            unchanged)
+              echo "::notice::Game build ${GAME} is already published; the floating game-build tag stays where it is."
+              # A registry that joined later (Docker Hub) still gets the digests GHCR already has for these tags.
+              for image in ${IMAGES}; do
+                [ "${image}" = "${GHCR_IMAGE}" ] && continue
+                for t in ${floating} ${pin}; do
+                  src="$(resolve "${GHCR_IMAGE}:${t}")"
+                  [ -n "${src}" ] || continue
+                  if [ "$(resolve "${image}:${t}")" != "${src}" ]; then
+                    docker buildx imagetools create -t "${image}:${t}" "${GHCR_IMAGE}@${src}"
+                    echo "${image}:${t} -> ${src} (copied from GHCR)"
+                  fi
+                done
+              done
+              ;;
+            *)
+              for image in ${IMAGES}; do
+                existing="$(resolve "${image}:${pin}")"
+                if [ -n "${existing}" ] && [ "${existing}" != "${DIGEST}" ]; then
+                  echo "::error::${image}:${pin} already exists at ${existing}; that tag is immutable and is not moved to ${DIGEST}." >&2
+                  exit 1
+                fi
+                docker buildx imagetools create -t "${image}:${floating}" -t "${image}:${pin}" "${image}@${DIGEST}"
+                echo "${image}: ${floating} ${pin} -> ${DIGEST}"
+              done
+              ;;
+          esac
+
+          {
+            echo "### ${GHCR_IMAGE#ghcr.io/} ${VERSION} (game build ${GAME})"
+            echo
+            echo "Digest ${DIGEST} (${PLATFORMS}); depot manifests ${MANIFESTS}"
+            echo
+            echo "| Registry | Tag | Digest |"
+            echo "| --- | --- | --- |"
+            for image in ${IMAGES}; do
+              for t in "${VERSION}" ${floating} "${pin}" latest; do
+                echo "| ${image} | ${t} | $(resolve "${image}:${t}") |"
+              done
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
